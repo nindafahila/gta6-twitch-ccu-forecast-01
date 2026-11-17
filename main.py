@@ -16,23 +16,36 @@ happened yet at hour 1).  So for each hour 2..24 we fit
     log(v_h) = a_h + b_h * log(h1) + eps
 
 by ordinary least squares over the comparables, and take the forecast
-quantiles from the residual distribution: the empirical quantiles of
-the pooled residuals blended 50/50 with normal quantiles at the
-per-hour residual sd.  That gives honest, wide intervals -- the
-residual sd is ~0.3 log units in the small hours and ~0.8-1.1 in the
-evening, i.e. the 5-95% band spans roughly a factor 10 at the peak --
-because the evening level of a launch is genuinely hard to pin down
-from hour 1 alone (across launches it ranges from below h1 to >10x h1).
+quantiles from the residual distribution: per-hour empirical residual
+quantiles, shrunk toward the pooled empirical quantiles (k=10
+pseudo-counts -- n_h ~ 37 points per hour is too few for the 5%/95%
+tails on their own), blended 0.75/0.25 with normal quantiles at the
+per-hour residual sd.  The residuals are winsorized first at their
+pooled 2.5%/97.5% quantiles: a few launches have extreme evening
+residuals (10x nights), and without the clip those outliers stretch
+every hour's empirical quantiles.  Evening residuals are wider and
+more skewed than small-hour ones, so the hour-specific shape matters.
+That gives honest, wide intervals -- the residual sd is ~0.3 log units
+in the small hours and ~0.8-1.1 in the evening, i.e. the 5-95% band
+spans roughly a factor 10 at the peak -- because the evening level of
+a launch is genuinely hard to pin down from hour 1 alone (across
+launches it ranges from below h1 to >10x h1).
 
 Validation (leave-one-out over the 38 practice comparables, and the
 exact Wolverine practice answers):
-  * this model:  LOO mean pinball 0.438, median 0.350; Wolverine 0.205
+  * this model:  LOO mean pinball 0.435, median 0.341; Wolverine 0.204
+    (before the quantile fix: LOO 0.438/0.350, Wolverine 0.205 -- the
+    fix improves all four: LOO mean, median, big-launch subset
+    0.349 -> 0.341, and Wolverine)
   * house baseline (flat at h1, spread 0.15*sqrt(h-1)):
                  LOO mean pinball 0.930, median 0.325; Wolverine 0.744
   * median-ratio curve: LOO 0.803; k-NN on the pre-midnight trajectory:
     LOO 0.66-0.74.  Adding pre-midnight features (level at -1h, ramp
     slope, pre-midnight peak) did not improve LOO -- with ~40 launches
-    the extra coefficients only add variance.
+    the extra coefficients only add variance.  Also tried and rejected:
+    smoothing the OLS slope across hours (LOO 0.444), Student-t tails
+    (0.439), shrinking the per-hour sd toward the global sd (0.439),
+    and winsorizing beyond 5% (LOO mean turns back up at 7.5%).
 
 Deterministic (no randomness), stdlib only, runs in well under a second.
 Reads every *.in file in the input dir, writes one *.out per case.
@@ -143,12 +156,23 @@ def forecast(h1, comparables):
     all_resid.sort()
     n = len(all_resid)
 
-    def rq(tau):
-        i = tau * (n - 1)
+    def rq(vals, tau):
+        i = tau * (len(vals) - 1)
         lo, hi = int(math.floor(i)), int(math.ceil(i))
-        return all_resid[lo] + (all_resid[hi] - all_resid[lo]) * (i - lo)
+        return vals[lo] + (vals[hi] - vals[lo]) * (i - lo)
 
-    rqs = [rq(t) for t in LEVELS]
+    # Winsorize: a few launches have extreme evening residuals (10x nights);
+    # clipping the residuals at their pooled 2.5%/97.5% quantiles keeps those
+    # outliers from stretching every hour's empirical quantiles. The clip is
+    # applied to the pooled list and to each hour's residuals alike.
+    lo_w, hi_w = rq(all_resid, 0.025), rq(all_resid, 0.975)
+    all_resid = [min(max(r, lo_w), hi_w) for r in all_resid]
+    for h in per_hour:
+        if per_hour[h] is not None:
+            b, rs = per_hour[h]
+            per_hour[h] = (b, [min(max(r, lo_w), hi_w) for r in rs])
+
+    rqs = [rq(all_resid, t) for t in LEVELS]
     gsd = statistics.pstdev(all_resid) if n > 1 else 0.5
 
     out = {}
@@ -160,11 +184,20 @@ def forecast(h1, comparables):
         beta, resid = ph
         mu = beta[0] + beta[1] * lh1
         sd_h = statistics.pstdev(resid) if len(resid) > 1 else gsd
+        # Per-hour empirical residual quantiles, shrunk toward the pooled
+        # ones (n_h ~ 37 points per hour is too few for the 5%/95% tails
+        # on their own; k=10 pseudo-counts): evening residuals are wider
+        # and more skewed than small-hour ones, so the hour-specific shape
+        # matters. Blend 0.75 empirical / 0.25 normal.
+        rs = sorted(resid)
+        m = len(rs)
+        rq_h = [rq(rs, t) for t in LEVELS]
+        rq_use = [(m * a + 10.0 * b) / (m + 10.0) for a, b in zip(rq_h, rqs)]
         qs = []
         for j in range(5):
-            q_emp = mu + rqs[j]
+            q_emp = mu + rq_use[j]
             q_nor = mu + Z[j] * sd_h
-            qs.append(math.exp(0.5 * q_emp + 0.5 * q_nor))
+            qs.append(math.exp(0.75 * q_emp + 0.25 * q_nor))
         for j in range(1, 5):
             qs[j] = max(qs[j], qs[j - 1])
         out[h] = [max(1.0, min(MAX_Q, q)) for q in qs]
